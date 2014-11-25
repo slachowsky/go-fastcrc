@@ -1,0 +1,174 @@
+// Copyright 2011 The Go Authors. All rights reserved.
+// Use of this source code is governed by a BSD-style
+// license that can be found in the LICENSE file.
+
+//#include "../../../cmd/ld/textflag.h"
+#define NOSPLIT 4
+
+// func castagnoliSSE42(crc uint32, p []byte) uint32
+TEXT ·castagnoliSSE42(SB),NOSPLIT,$0
+	MOVL crc+0(FP), AX  // CRC value
+	MOVQ p+8(FP), SI  // data pointer
+	MOVQ p_len+16(FP), CX  // len(p)
+
+	NOTL AX
+
+	/* If there's less than 8 bytes to process, we do it byte-by-byte. */
+	CMPQ CX, $8
+	JL cleanup
+
+	/* Process individual bytes until the input is 8-byte aligned. */
+startup:
+	MOVQ SI, BX
+	ANDQ $7, BX
+	JZ aligned
+
+	CRC32B (SI), AX
+	DECQ CX
+	INCQ SI
+	JMP startup
+
+aligned:
+	/* The input is now 8-byte aligned and we can process 8-byte chunks. */
+	CMPQ CX, $8
+	JL cleanup
+
+	CRC32Q (SI), AX
+	ADDQ $8, SI
+	SUBQ $8, CX
+	JMP aligned
+
+cleanup:
+	/* We may have some bytes left over that we process one at a time. */
+	CMPQ CX, $0
+	JE done
+
+	CRC32B (SI), AX
+	INCQ SI
+	DECQ CX
+	JMP cleanup
+
+done:
+	NOTL AX
+	MOVL AX, ret+32(FP)
+	RET
+
+// func haveSSE42() bool
+TEXT ·haveSSE42(SB),NOSPLIT,$0
+	XORQ AX, AX
+	INCL AX
+	CPUID
+	SHRQ $20, CX
+	ANDQ $1, CX
+	MOVB CX, ret+0(FP)
+	RET
+
+// func havePCLMULQDQ() bool
+TEXT ·havePCLMULQDQ(SB),NOSPLIT,$0
+	XORQ AX, AX
+	INCL AX
+	CPUID
+	SHRQ $4, CX
+	ANDQ $1, CX
+	MOVB CX, ret+0(FP)
+	RET
+
+#define CONSTANT X0
+
+#define BUF     DI
+#define TAB     SI
+#define LEN     CX
+#define CRC     DX
+
+#define R2R1 0(TAB)
+#define R4R3 16(TAB)
+#define R5   32(TAB)
+#define mask32 48(TAB)
+#define RUpoly 64(TAB)
+
+#define MOVDQA MOVDQU
+
+// func crcIEEE(crc uint32, tab *Table, p []byte) uint32
+TEXT ·crcIEEE(SB),NOSPLIT,$0
+	MOVL crc+0(FP), CRC  // CRC value
+	MOVQ tab+8(FP), TAB  // table pointer
+	MOVQ p+16(FP), BUF  // data pointer
+	MOVQ p_len+24(FP), LEN  // len(p)
+
+	MOVDQA  (BUF), X1
+
+//	MOVDQA  0x10(BUF), X2
+//	MOVDQA  0x20(BUF), X3
+//	MOVDQA  0x30(BUF), X4
+	NOTL	CRC
+	MOVD    CRC, CONSTANT
+	PXOR    CONSTANT, X1
+
+//	MOVDQA R2R1, CONSTANT
+
+//4*128 loop
+
+	MOVDQA  R4R3, CONSTANT
+
+loop_fold128:
+	CMPQ LEN, $16
+	JLE trailing
+
+	ADDQ	$16, BUF
+	SUBQ	$16, LEN
+
+	MOVDQA	(BUF), X2
+/// need to shift through the two regs X1, X2
+
+	MOVDQA  X1, X5
+	PCLMULQDQ $0x00, CONSTANT, X1
+	PCLMULQDQ $0x11, CONSTANT, X5
+	PXOR    X5, X1
+	PXOR    X2, X1
+
+	JMP loop_fold128
+trailing:
+/// trailing unaligned
+	ANDQ $0xf, LEN
+	JZ last
+	NOP
+	MOVDQA	(BUF), X2
+
+	MOVDQA  X1, X5
+	PCLMULQDQ $0x00, CONSTANT, X1
+	PCLMULQDQ $0x11, CONSTANT, X5
+	PXOR    X5, X1
+	PXOR    X2, X1
+	
+last:
+/* perform the last 64 bit fold, also adds 32 zeroes
+ * to the input stream */
+	PCLMULQDQ $0x01, X1, CONSTANT /* R4 * xmm1.low */
+	PSRLDQ  $0x08, X1
+	PXOR    CONSTANT, X1
+
+/* final 32-bit fold */
+	MOVDQA  X1, X2
+
+	MOVDQA  R5, CONSTANT
+	MOVDQA  mask32, X3
+
+	PSRLDQ  $0x04, X2
+	PAND    X3, X1
+	PCLMULQDQ $0x00, CONSTANT, X1
+	PXOR    X2, X1
+
+/* Finish up with the bit-reversed barrett reduction 64 ==> 32 bits */
+	MOVDQA  RUpoly, CONSTANT
+	MOVDQA  X1, X2
+	PAND    X3, X1
+	PCLMULQDQ $0x10, CONSTANT, X1
+	PAND    X3, X1
+	PCLMULQDQ $0x00, CONSTANT, X1
+	PXOR    X2, X1
+	//PEXTRD  $0x01, X1, AX
+	BYTE $0x66; BYTE $0x0f; BYTE $0x3a; BYTE $0x16; BYTE $0xc8; BYTE $0x01
+
+	NOTL AX
+	MOVL AX, ret+40(FP)
+	RET
